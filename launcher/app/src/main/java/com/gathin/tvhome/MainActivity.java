@@ -300,6 +300,15 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             open(i);
         }
     };
+    /** home_on_standby: standbyReceiver is registered for this activity's life. */
+    private boolean homeOnStandby;
+    /** home_on_standby: the screen went off, so bring Home to the front at its first tile (see goHomeForStandby). */
+    private final BroadcastReceiver standbyReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) goHomeForStandby();
+        }
+    };
     private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -494,6 +503,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         openOnStartChoice = cfg.openOnStartChoice;
         openOnStartWaitMs = cfg.openOnStartNetworkWait * 1000L;
         openOnStartOnWake = OpenOnStart.onWake(cfg.openOnStartChoice, cfg.openOnStartOnWake);
+        homeOnStandby = cfg.homeOnStandby;
         liveTvAction = cfg.liveTvAction;
         liveTvInputId = cfg.liveTvInputId;
         appLibraryEnabled = cfg.appLibrary;
@@ -850,7 +860,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             libraryFromTopBar = true;   // closing it goes back to this button, not to the pill after the last row
         });
         btnLibraryTop.setVisibility(cfg.libraryButton && cfg.appLibrary ? View.VISIBLE : View.GONE);
-        addTopBarApps(cfg.topBarApps, cfg.launchActions);
+        addTopBarApps(cfg.topBarApps, cfg.launchActions, cfg.appLabels);
         iconOnlyButtons = cfg.iconOnlyButtons;
         topMenu = cfg.topMenu;
         wifiIconOnly = iconOnlyButtons && cfg.wifiLabelWidth <= 0;
@@ -910,7 +920,9 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             }
             int firstButton = btnInputs.getVisibility() == View.VISIBLE ? R.id.btnInputs : firstTopButton().getId();
             int leftButton = rtlMenuBar ? R.id.btnSettings : firstButton;
-            int rightButton = rtlMenuBar ? firstButton : R.id.btnSettings;
+            // Local change: the right end is the last top_bar_apps button when there is one.
+            int rightButton = rtlMenuBar ? firstButton
+                    : topAppButtons.isEmpty() ? R.id.btnSettings : topAppButtons.get(topAppButtons.size() - 1).getId();
             if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) return v.getId() == leftButton;
             return keyCode == KeyEvent.KEYCODE_DPAD_RIGHT && v.getId() == rightButton;
         };
@@ -947,6 +959,13 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             registerReceiver(packageReceiver, packageFilter, Context.RECEIVER_NOT_EXPORTED);
         } else {
             registerReceiver(packageReceiver, packageFilter);
+        }
+        if (homeOnStandby) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(standbyReceiver, new IntentFilter(Intent.ACTION_SCREEN_OFF), Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(standbyReceiver, new IntentFilter(Intent.ACTION_SCREEN_OFF));
+            }
         }
         if (openOnStartOnWake) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1045,6 +1064,22 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         setIntent(new Intent(Intent.ACTION_MAIN));
         startActivityForResult(new Intent(this, LauncherSettingsActivity.class), LAUNCHER_SETTINGS_REQUEST);
         return true;
+    }
+
+    /**
+     * home_on_standby: the same Home intent the remote's Home button sends, so the app or input in front goes to the
+     * background and onNewIntent puts the grid back at the first tile; onResume closes the library, a tile menu or a
+     * card prompt left open. As the home process this launcher may start it from the background (Android 10+).
+     */
+    private void goHomeForStandby() {
+        startPending = null;   // an Open on start app still waiting for the network stays closed
+        Intent home = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).setPackage(getPackageName())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        try {
+            startActivity(home);
+        } catch (RuntimeException ignored) {
+            // Refused (a firmware that blocks it): the TV simply wakes where it was, as without the switch.
+        }
     }
 
     /**
@@ -1393,6 +1428,7 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
         if (gameDay != null) gameDay.shutdown();
         unregisterReceiver(packageReceiver);
         if (openOnStartOnWake) unregisterReceiver(wakeReceiver);
+        if (homeOnStandby) unregisterReceiver(standbyReceiver);
         wallpaperPlayer.close();
         ConnectivityManager cm = getApplicationContext().getSystemService(ConnectivityManager.class);   // as registered
         TvInputManager tim = (TvInputManager) getSystemService(TV_INPUT_SERVICE);
@@ -2588,13 +2624,19 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
      * Puts each top_bar_apps app in the top bar as a round pill with the app's own logo, left of the network pill.
      * The logo keeps its colours: the pill style's tint, which turns the other icons white, is cleared.
      */
-    private void addTopBarApps(List<String> packages, Map<String, String> launchActions) {
+    private void addTopBarApps(List<String> packages, Map<String, String> launchActions, Map<String, String> appLabels) {
         ViewGroup bar = findViewById(R.id.topButtons);
         PackageManager pm = getPackageManager();
         int size = Math.round(22 * density);
         for (String pkg : packages) {
             Intent launch = pm.getLeanbackLaunchIntentForPackage(pkg);
             if (launch == null) launch = pm.getLaunchIntentForPackage(pkg);
+            // Local change: an app with no launcher entry (e.g. com.android.tv.settings) still gets a button when
+            // its launch_actions entry resolves, such as the About page that holds "Restart".
+            if (launch == null && launchActions.containsKey(pkg) && LaunchActions.inputId(launchActions.get(pkg)) == null) {
+                Intent custom = LaunchActions.intent(pkg, launchActions.get(pkg));
+                if (pm.resolveActivity(custom, 0) != null) launch = custom;
+            }
             if (launch == null) continue;   // not installed, or disabled
             // Use the same configured launch_actions as tiles; retain the normal entry if unavailable.
             launch = LaunchActions.select(pkg, launchActions, launch, (targetPackage, action) -> {
@@ -2610,20 +2652,31 @@ public class MainActivity extends Activity implements AppAdapter.TileListener {
             } catch (PackageManager.NameNotFoundException e) {
                 continue;
             }
-            TextView button = (TextView) getLayoutInflater().inflate(R.layout.top_app_button, bar, false);
+            // Local change: an app_labels name turns the round button into a pill with that text.
+            String pillLabel = appLabels.get(pkg);
+            TextView button = (TextView) getLayoutInflater().inflate(
+                    pillLabel != null ? R.layout.top_app_button_label : R.layout.top_app_button, bar, false);
             // pillKeys finds the bar's ends by id: without one of its own, every app button would be an end.
             button.setId(View.generateViewId());
-            logo.setBounds(0, 0, size, size);
-            button.setCompoundDrawablesRelative(logo, null, null, null);
-            button.setCompoundDrawableTintList(null);
-            button.setContentDescription(label);
+            if (Settings.ACTION_DEVICE_INFO_SETTINGS.equals(launchActions.get(pkg))) {
+                // Local change: the About page holds Restart, so show a restart icon, inked like the other pills.
+                button.setCompoundDrawablesRelativeWithIntrinsicBounds(R.drawable.ic_restart, 0, 0, 0);
+            } else {
+                logo.setBounds(0, 0, size, size);
+                button.setCompoundDrawablesRelative(logo, null, null, null);
+                button.setCompoundDrawableTintList(null);
+            }
+            if (pillLabel != null) button.setText(pillLabel);
+            button.setContentDescription(pillLabel != null ? pillLabel : label);
             Intent target = launch;
             // An input: action switches the TV input, as the tile for the same app does.
             String inputId = LaunchActions.inputId(launchActions.get(pkg));
             if (inputId != null) button.setOnClickListener(v -> openInput(inputId));
             else button.setOnClickListener(v -> open(new Intent(target)));
             // After the network pill and the VPN pill; the Hebrew bar runs the other way, so before both there.
-            bar.addView(button, bar.indexOfChild(getResources().getBoolean(R.bool.rtl_menu_bar) ? btnVpn : btnWifi));
+            // Local change: after the Settings pill, in top_bar_apps order (left-to-right bars only).
+            if (getResources().getBoolean(R.bool.rtl_menu_bar)) bar.addView(button, bar.indexOfChild(btnVpn));
+            else bar.addView(button);
             topAppButtons.add(button);
         }
     }

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Local addition: a top_bar_apps button with a name from app_labels, shaped like the Settings pill. -->
+<TextView xmlns:android="http://schemas.android.com/apk/res/android"
+    style="@style/TopButton"
+    android:singleLine="true"
+    android:nextFocusDown="@+id/grid" />
